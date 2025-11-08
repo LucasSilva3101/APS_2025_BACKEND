@@ -4,7 +4,8 @@ import uuid
 import base64
 import asyncio
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
+from collections import Counter
 
 import numpy as np
 import cv2
@@ -23,7 +24,6 @@ MONGO_URI       = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB        = os.getenv("MONGO_DB", "visionway")
 MONGO_COL       = os.getenv("MONGO_COL", "historico")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-DETECTOR        = os.getenv("DETECTOR", "owlv2").lower()  # só OWL-V2 agora
 OV_CONF_THRESHOLD = float(os.getenv("OV_CONF_THRESHOLD", "0.25"))
 OV_LABELS_STR   = os.getenv(
     "OV_LABELS",
@@ -72,7 +72,7 @@ OV_LABELS_PT = {
 # =====================================================
 # FastAPI & CORS
 # =====================================================
-app = FastAPI(title="VisionWay API", version="3.1.0")
+app = FastAPI(title="VisionWay API", version="3.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS else ["*"],
@@ -118,7 +118,9 @@ class Detection(BaseModel):
 
 class PredictResponse(BaseModel):
     image: str
-    detections: List[Detection]
+    detections: List[Detection]      # todas as detecções
+    labels_unique: List[str]         # rótulos únicos (PT)
+    counts_by_label: Dict[str, int]  # contagem por rótulo (PT)
     count: int
     timestamp: str
     meta: Dict[str, Any]
@@ -158,7 +160,7 @@ processor = AutoProcessor.from_pretrained("google/owlv2-base-patch16-ensemble")
 ov_model = AutoModelForZeroShotObjectDetection.from_pretrained(
     "google/owlv2-base-patch16-ensemble"
 )
-print("[OWL-V2] Pronto. Labels:", OV_LABELS)
+print("[OWL-V2] Pronto. Labels (EN):", OV_LABELS)
 
 def infer_owlv2(img_bgr: np.ndarray):
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -182,14 +184,15 @@ def infer_owlv2(img_bgr: np.ndarray):
     ):
         conf = float(score.item())
         label_en = OV_LABELS[int(lab_idx.item())]
-        label = OV_LABELS_PT.get(label_en, label_en)  # traduz para PT se disponível
+        label_pt = OV_LABELS_PT.get(label_en, label_en)  # traduz para PT
         x1, y1, x2, y2 = [float(v) for v in box.tolist()]
-        dets.append(Detection(label=label, confidence=round(conf, 4),
+        dets.append(Detection(label=label_pt, confidence=round(conf, 4),
                               bbox_xyxy=[x1, y1, x2, y2]))
+        # Desenho
         cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 160), 2)
         cv2.putText(
             annotated,
-            f"{label} {conf:.2f}",
+            f"{label_pt} {conf:.2f}",
             (int(x1), max(0, int(y1) - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -211,7 +214,7 @@ def version():
     return {
         "api_version": app.version,
         "detector": "owlv2",
-        "ov_labels": OV_LABELS_PT,
+        "ov_labels_pt": list(OV_LABELS_PT.values()),
         "conf_threshold": OV_CONF_THRESHOLD,
         "ts": datetime.utcnow().isoformat() + "Z",
     }
@@ -224,14 +227,23 @@ async def predict(file: UploadFile = File(...)):
         start = time.perf_counter()
         content = await file.read()
         img = np_from_upload(content)
+
         annotated, dets = await asyncio.to_thread(infer_owlv2, img)
+
+        # -------- NOVO: rótulos únicos e contagem por rótulo --------
+        labels_list = [d.label for d in dets]                 # PT
+        counts_by_label = dict(Counter(labels_list))          # {label: qtd}
+        labels_unique = sorted(counts_by_label.keys())        # deduplicados
+
         out_b64 = to_base64_jpeg(annotated)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
 
         resp = PredictResponse(
             image=out_b64,
-            detections=dets,
-            count=len(dets),
+            detections=dets,                # mantemos lista completa (se precisar)
+            labels_unique=labels_unique,    # únicos
+            counts_by_label=counts_by_label,# contagem
+            count=len(dets),                # total bruto
             timestamp=datetime.utcnow().isoformat() + "Z",
             meta={
                 "detector": "owlv2",
@@ -240,10 +252,13 @@ async def predict(file: UploadFile = File(...)):
             },
         )
 
+        # Registro no Mongo com campos novos
         doc = {
             "_id": str(uuid.uuid4()),
             "image": resp.image,
             "detections": [d.model_dump() for d in dets],
+            "labels_unique": labels_unique,
+            "counts_by_label": counts_by_label,
             "count": resp.count,
             "timestamp": resp.timestamp,
             "meta": resp.meta,
@@ -268,6 +283,8 @@ async def get_history(limit: int = Query(50, ge=1, le=200), offset: int = Query(
                 id=str(d.get("_id")),
                 image=d.get("image", ""),
                 detections=detections,
+                labels_unique=d.get("labels_unique", []),
+                counts_by_label=d.get("counts_by_label", {}),
                 count=int(d.get("count", 0)),
                 timestamp=d.get("timestamp", ""),
                 meta=d.get("meta", {}),
